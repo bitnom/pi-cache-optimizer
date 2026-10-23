@@ -481,13 +481,16 @@ describe("native virtual model hooks", () => {
     const routedCtx = context(selected, { ...options, branch: [{ type: "message", message }] }, { statuses, notifications });
 
     await hooks.get("session_start")!({ reason: "startup" }, startCtx);
+    await extension.__internals_for_tests.waitForStatsRestore();
     await hooks.get("message_end")!({ message }, routedCtx);
+    await extension.__internals_for_tests.statsRefreshSettled();
     const routedStatus = statuses.at(-1);
     assert.match(routedStatus ?? "", /^· Kimi cache 1\/1·/);
 
     // Later lifecycle refreshes resolve the same physical model instead of
     // clearing the footer for the virtual selection.
     await hooks.get("agent_settled")!({}, routedCtx);
+    await extension.__internals_for_tests.statsRefreshSettled();
     assert.equal(statuses.at(-1), routedStatus);
 
     await commands.get("cache-optimizer")!.handler("stats", routedCtx);
@@ -501,6 +504,7 @@ describe("native virtual model hooks", () => {
     const reloadStatuses: Array<string | undefined> = [];
     const reloadCtx = context(selected, { ...options, branch: [{ type: "message", message }] }, { statuses: reloadStatuses });
     await reloaded.hooks.get("session_start")!({ reason: "reload" }, reloadCtx);
+    await extension.__internals_for_tests.waitForStatsRestore();
     assert.match(reloadStatuses.at(-1) ?? "", /^· Kimi cache 1\/1·/);
     await reloaded.hooks.get("session_shutdown")!({}, reloadCtx);
   });
@@ -515,6 +519,7 @@ describe("native virtual model hooks", () => {
     const ctx = context(selected, { sessionId: "unrouted-session" }, { statuses, notifications });
 
     await hooks.get("agent_settled")!({}, ctx);
+    await extension.__internals_for_tests.statsRefreshSettled();
     assert.deepEqual(statuses.filter((status) => status !== undefined), []);
 
     await commands.get("cache-optimizer")!.handler("compat", ctx);
@@ -687,6 +692,91 @@ describe("native virtual model hooks", () => {
       assert.ok(event.systemPrompt.includes("- alpha: alpha skill description"), "earlier compression survives later section edits");
     });
 
+    test("compresses a verbose copy in customPrompt too, so an inherited parent prompt is not forced", async () => {
+      const pi = await loadPi();
+      const { hooks } = setup();
+      // pi-subagents passes an idle parent's base render (verbose skills list) as the child's customPrompt.
+      const parent = pi.buildSystemPrompt(pi.normalizeBuildSystemPromptOptions({ cwd: "/repo", skills, selectedTools: ["read", "bash"] } as any));
+      const { options, event } = piEvent(pi, { customPrompt: parent + "\n\n<sub_agent_context/>" });
+      assert.ok(event.systemPrompt.split("<available_skills>").length === 3, "both copies are verbose before");
+      const result = await hooks.get("before_agent_start")!(event, context(physical("proxy", "kimi-k3")));
+      assert.deepEqual(result, {}, "no forced prompt");
+      assert.equal(typeof options.sections.skills, "string");
+      assert.ok(!event.systemPrompt.includes("<available_skills>"));
+      assert.equal(event.systemPrompt.split("- alpha: alpha skill description").length, 3, "both copies are compressed");
+      assert.ok(options.customPrompt?.endsWith("<sub_agent_context/>"));
+    });
+
+    test("compresses an inherited list without adding a skills section when Pi renders none (no read/bash tool)", async () => {
+      const pi = await loadPi();
+      const { hooks } = setup();
+      const parent = pi.buildSystemPrompt(pi.normalizeBuildSystemPromptOptions({ cwd: "/repo", skills, selectedTools: ["read", "bash"] } as any));
+      const { options, event } = piEvent(pi, { customPrompt: parent, selectedTools: ["edit", "write"] });
+      assert.equal(pi.buildSystemPromptSections(options as any).skills, undefined, "Pi renders no skills section for this child");
+      const result = await hooks.get("before_agent_start")!(event, context(physical("proxy", "kimi-k3")));
+      assert.deepEqual(result, {}, "no forced prompt");
+      assert.equal(options.sections.skills, undefined, "no skills section is added");
+      assert.equal(pi.buildSystemPromptSections(options as any).skills, undefined);
+      assert.ok(!event.systemPrompt.includes("<available_skills>"));
+      assert.ok(event.systemPrompt.includes("- alpha: alpha skill description"));
+      assert.equal(t.getLastSkillCompressionOutcome()?.applied, "section");
+    });
+
+    test("rolls customPrompt back when the re-render drops the verbose list but not into the compressed one", async () => {
+      const rw = await jiti.import<typeof import("../src/prompt-rewrite.ts")>(join(process.cwd(), "src", "prompt-rewrite.ts"));
+      const options: any = { customPrompt: "", sections: {}, skills, selectedTools: ["read"] };
+      const verbose = t.formatSkillsForPrompt(skills as any).trim();
+      options.customPrompt = `head\n${verbose}`;
+      const original = options.customPrompt;
+      let reads = 0;
+      // First read (gate) sees the verbose list; later reads see neither form.
+      const event = { get systemPrompt() { return reads++ === 0 ? original : "unrelated"; }, systemPromptOptions: options };
+      assert.equal(rw.compressSkillsViaSection(event as any), false);
+      assert.equal(options.customPrompt, original);
+      assert.equal(options.sections.skills, undefined);
+    });
+
+    test("leaves customPrompt unchanged when the section edit is rolled back", async () => {
+      const pi = await loadPi();
+      const { hooks } = setup();
+      const parent = pi.buildSystemPrompt(pi.normalizeBuildSystemPromptOptions({ cwd: "/repo", skills, selectedTools: ["read", "bash"] } as any));
+      const { options, event } = piEvent(pi, { customPrompt: parent });
+      // A later-applied verbose copy outside customPrompt and sections keeps the re-render verbose.
+      options.appendSystemPrompt = t.formatSkillsForPrompt(skills as any).trim();
+      await hooks.get("before_agent_start")!(event, context(physical("proxy", "kimi-k3")));
+      assert.equal(options.customPrompt, parent);
+      assert.equal(options.sections.skills, undefined);
+    });
+
+    test("compresses every inherited copy byte-safely, deterministically, and keeps the parent's sent prompt as the child's prefix", async () => {
+      const pi = await loadPi();
+      const { hooks } = setup();
+      // `$&`/`$'` would be expanded by a String#replace with a string replacement; two copies need a global replace.
+      const dollarSkills = skills.map((skill, index) => index === 0 ? { ...skill, description: "costs $& and $' tokens" } : skill);
+      const base = { cwd: "/repo", skills: dollarSkills, selectedTools: ["read", "bash"] };
+      const parentIdle = pi.buildSystemPrompt(pi.normalizeBuildSystemPromptOptions(base as any));
+      // What the parent actually sends while running (its own hook compressed the section).
+      const parent = piEvent(pi, { skills: dollarSkills });
+      assert.deepEqual(await hooks.get("before_agent_start")!(parent.event, context(physical("proxy", "kimi-k3"))), {});
+      const parentSent = parent.event.systemPrompt;
+      const compressed = t.formatSkillsForPromptCompressed(dollarSkills as any).trim();
+      assert.ok(parentSent.includes(compressed));
+
+      const childRender = async (customPrompt: string) => {
+        const child = piEvent(pi, { skills: dollarSkills, customPrompt });
+        assert.deepEqual(await hooks.get("before_agent_start")!(child.event, context(physical("proxy", "kimi-k3"))), {}, "no forced prompt");
+        return child.event.systemPrompt;
+      };
+      const first = await childRender(parentIdle + "\n\n<sub_agent_context/>");
+      assert.equal(first, await childRender(parentIdle + "\n\n<sub_agent_context/>"), "byte-identical across runs (cache-stable)");
+      assert.ok(first.startsWith(parentSent), "child prefix equals the prompt the parent sends");
+      assert.ok(!first.includes("<available_skills>"));
+
+      const twice = await childRender(parentIdle + "\n\n" + parentIdle);
+      assert.ok(!twice.includes("<available_skills>"), "every copy is compressed");
+      assert.equal(twice.split(compressed).length, 4, "two inherited copies plus the child's own section");
+    });
+
     test("falls back to the string substitution after a forced prompt or without sections support", async () => {
       const pi = await loadPi();
       const { hooks } = setup();
@@ -813,9 +903,11 @@ describe("native virtual model hooks", () => {
     const ctx = context(physical("proxy", "kimi-k3", { name: "Kimi K3" }), { sessionId: "nested-session" }, { statuses });
 
     await hooks.get("tool_execution_end")!({ toolCallId: "nested", toolName: "read", parentToolCallId: "codemode-1", isError: false }, ctx);
+    await extension.__internals_for_tests.statsRefreshSettled();
     assert.equal(statuses.length, 0);
 
     await hooks.get("tool_execution_end")!({ toolCallId: "codemode-1", toolName: "codemode", isError: false }, ctx);
+    await extension.__internals_for_tests.statsRefreshSettled();
     assert.equal(statuses.length, 1);
     assert.match(statuses[0] ?? "", /^· Kimi cache 0\/0/);
   });

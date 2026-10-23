@@ -5,9 +5,10 @@ import { basename, dirname, join } from "node:path";
 import { type FileIdentity, atomicReplaceTextFilePreservingMode, atomicRestoreFileFromBackup, backupTimestamp, hashText, readRegularTextFile, sameFileIdentity, uniqueTempPath, validateAtomicTarget, withModelsJsonTransactionLock, writeFileExclusiveDurable } from "./atomic-fs.ts";
 import { LOG_PREFIX, type PiModel, asRecord, getErrorCode } from "./common.ts";
 import { findLastExactModelDefinition, resolveEffectiveCompatFromConfig } from "./compat-config.ts";
-import { type FixReceiptCompatChange, type FixReceiptPlacement, type ModelsJsonFixReceiptV1, RECEIPT_COMPAT_KEYS, type ReceiptScalar, type ReceiptScalarState, isReceiptTimestamp, isSafeReceiptText, isSha256 } from "./fix-types.ts";
+import { type FixReceiptCompatChange, type FixReceiptPlacement, type ModelsJsonFixReceiptV1, type PromptCacheLifetimes, RECEIPT_COMPAT_KEYS, type ReceiptScalar, type ReceiptScalarState, isReceiptTimestamp, isValidPromptCacheLifetimes, samePromptCacheLifetimes, isSafeReceiptText, isSha256 } from "./fix-types.ts";
 import { type JsonPropertyEdit, type ModelNodeLocation, deepEqualIgnoringKeys, deriveInnerIndent, findExistingCompatKeysInJsonc, findJsonObjectKey, findMatchingBracket, isJsonWhitespace, lineIndentOf, locateJsonPropertyValueSpan, locateModelOverrideInJsonc, locateProviderCompatInJsonc, parseJsonc, readJsonStringLiteral, skipJsonValue, skipJsonWhitespace, stripJsoncComments } from "./jsonc.ts";
 import { isAdaptiveGenerationModel, isKimiCodingAdaptiveModel } from "./model-detect.ts";
+import { isKimiCodeV1BaseUrlChange } from "./kimi-code.ts";
 import { FIX_RECEIPT_PATH, MODELS_JSON_PATH } from "./paths.ts";
 
 export type ExplicitCompatSource = "modelOverride" | "model" | "provider";
@@ -1528,10 +1529,10 @@ export function createRollbackBackupPath(modelsPath: string = MODELS_JSON_PATH):
 
 export function parseModelsJsonFixReceipt(value: unknown): ModelsJsonFixReceiptV1 | undefined {
   const record = asRecord(value);
-  if (!record || record.version !== 1 || record.kind !== "pi-cache-optimizer-fix-receipt") return undefined;
+  if (!record || (record.version !== 1 && record.version !== 2 && record.version !== 3) || record.kind !== "pi-cache-optimizer-fix-receipt") return undefined;
   const allowedKeys = new Set([
     "version", "kind", "transactionId", "provider", "modelId", "placement",
-    "targetExistedBefore", "changedKeys", "beforeHash", "afterHash", "backupFile",
+    "targetExistedBefore", "changedKeys", "promptCacheAdded", "baseUrlChange", "beforeHash", "afterHash", "backupFile",
     "createdAt", "appliedAt", "status", "rolledBackAt",
   ]);
   if (Object.keys(record).some((key) => !allowedKeys.has(key))) return undefined;
@@ -1544,8 +1545,24 @@ export function parseModelsJsonFixReceipt(value: unknown): ModelsJsonFixReceiptV
   const afterHash = typeof record.afterHash === "string" ? record.afterHash.toLowerCase() : "";
   if (beforeHash === afterHash) return undefined;
   if (!isReceiptTimestamp(record.createdAt) || !isReceiptTimestamp(record.appliedAt) || record.appliedAt < record.createdAt) return undefined;
+  // promptCacheAdded is the version 2 marker: present exactly on v2 receipts,
+  // only for model-scoped targets, and always a valid lifetime object.
+  const isV2 = record.version === 2;
+  if (isV2 !== (record.promptCacheAdded !== undefined)) return undefined;
+  if (isV2 && (!isValidPromptCacheLifetimes(record.promptCacheAdded) || record.placement === "provider")) return undefined;
+  // baseUrlChange is the version 3 marker: a single official Kimi Code
+  // `/coding` → `/coding/v1` rewrite at an existing provider or model target.
+  const isV3 = record.version === 3;
+  if (isV3 !== (record.baseUrlChange !== undefined)) return undefined;
+  const rawBaseUrlChange = asRecord(record.baseUrlChange);
+  if (isV3) {
+    if (!rawBaseUrlChange || Object.keys(rawBaseUrlChange).some((key) => key !== "before" && key !== "after")) return undefined;
+    if (!isKimiCodeV1BaseUrlChange(rawBaseUrlChange.before, rawBaseUrlChange.after)) return undefined;
+    if (record.placement === "modelOverride" || record.targetExistedBefore !== true) return undefined;
+  }
   const changedKeys = asRecord(record.changedKeys);
-  if (!changedKeys || Object.keys(changedKeys).length === 0) return undefined;
+  if (!changedKeys || (Object.keys(changedKeys).length === 0 && record.version === 1)) return undefined;
+  if (isV3 && Object.keys(changedKeys).length > 0) return undefined;
 
   const parsedChanges: Record<string, FixReceiptCompatChange> = {};
   for (const [key, rawChange] of Object.entries(changedKeys)) {
@@ -1563,8 +1580,12 @@ export function parseModelsJsonFixReceipt(value: unknown): ModelsJsonFixReceiptV
   if (record.status === "rolled_back" && (!isReceiptTimestamp(record.rolledBackAt) || record.rolledBackAt < record.appliedAt)) return undefined;
   if (record.status === undefined && record.rolledBackAt !== undefined) return undefined;
 
+  const promptCacheAdded = isV2 ? record.promptCacheAdded as PromptCacheLifetimes : undefined;
+  const baseUrlChange = isV3 && rawBaseUrlChange
+    ? { before: rawBaseUrlChange.before as string, after: rawBaseUrlChange.after as string }
+    : undefined;
   return {
-    version: 1,
+    version: isV3 ? 3 : isV2 ? 2 : 1,
     kind: "pi-cache-optimizer-fix-receipt",
     transactionId: record.transactionId.trim(),
     provider: record.provider.trim(),
@@ -1572,6 +1593,8 @@ export function parseModelsJsonFixReceipt(value: unknown): ModelsJsonFixReceiptV
     placement: record.placement,
     targetExistedBefore: record.targetExistedBefore,
     changedKeys: parsedChanges,
+    ...(promptCacheAdded ? { promptCacheAdded: { ...(promptCacheAdded.short !== undefined ? { short: promptCacheAdded.short } : {}), ...(promptCacheAdded.long !== undefined ? { long: promptCacheAdded.long } : {}) } } : {}),
+    ...(baseUrlChange ? { baseUrlChange } : {}),
     beforeHash,
     afterHash,
     backupFile: record.backupFile,
@@ -1701,6 +1724,9 @@ export type ReceiptCompatTarget = {
   targetExists: boolean;
   compatBrace: number;
   compatEnd: number;
+  /** The model object or modelOverrides entry (-1 when absent or provider-level). */
+  objectBrace: number;
+  objectEnd: number;
 };
 
 export function locateReceiptCompatTarget(
@@ -1722,6 +1748,8 @@ export function locateReceiptCompatTarget(
       targetExists: location.modelOverrideObjectBrace >= 0,
       compatBrace: location.modelOverrideCompatBrace,
       compatEnd: location.modelOverrideCompatEnd,
+      objectBrace: location.modelOverrideObjectBrace,
+      objectEnd: location.modelOverrideObjectEnd,
     };
   }
 
@@ -1732,6 +1760,8 @@ export function locateReceiptCompatTarget(
       targetExists: true,
       compatBrace: location.providerCompatBrace,
       compatEnd: location.providerCompatEnd,
+      objectBrace: -1,
+      objectEnd: -1,
     };
   }
   const location = locateModelInJsonc(text, provider, modelId);
@@ -1746,6 +1776,8 @@ export function locateReceiptCompatTarget(
     targetExists: location.modelObjectBrace >= 0,
     compatBrace: location.compatObjectBrace,
     compatEnd: location.compatObjectEnd,
+    objectBrace: location.modelObjectBrace,
+    objectEnd: location.modelObjectEnd,
   };
 }
 
@@ -1770,6 +1802,166 @@ export function readReceiptCompatScalarState(
   } catch {
     return undefined;
   }
+}
+
+/**
+ * Read the direct `promptCache` value of a receipt target object: the parsed
+ * value, `undefined` when absent, or "invalid" when duplicated or unreadable.
+ */
+export function readReceiptPromptCacheState(
+  text: string,
+  target: ReceiptCompatTarget | undefined,
+): unknown {
+  if (!target || target.objectBrace < 0 || target.objectEnd <= target.objectBrace) return undefined;
+  const clean = stripJsoncComments(text);
+  const property = findJsonObjectKey(clean, target.objectBrace, "promptCache");
+  if (!property || property.keyStart >= target.objectEnd) return undefined;
+  if (property.count !== 1) return "invalid";
+  const valueStart = skipJsonWhitespace(clean, property.valueStart);
+  const valueEnd = skipJsonValue(clean, valueStart);
+  if (valueEnd === undefined || valueEnd > target.objectEnd) return "invalid";
+  try {
+    return parseJsonc(text.slice(valueStart, valueEnd));
+  } catch {
+    return "invalid";
+  }
+}
+
+/**
+ * Receipt for `/cache-optimizer fix prompt-cache`: a version 2 receipt with no
+ * compat changes and the promptCache object the fix added.
+ */
+export function createPromptCacheFixReceipt(
+  originalText: string,
+  modifiedText: string,
+  provider: string,
+  modelId: string,
+  placement: "model" | "modelOverride",
+  promptCache: PromptCacheLifetimes,
+  targetExistedBefore: boolean,
+  backupPath: string,
+  now: number = Date.now(),
+): ModelsJsonFixReceiptV1 | undefined {
+  const backupFile = basename(backupPath);
+  if (!/^models\.json\.backup-cache-optimizer-/.test(backupFile)) return undefined;
+  if (!isValidPromptCacheLifetimes(promptCache)) return undefined;
+  const beforeTarget = locateReceiptCompatTarget(originalText, provider, modelId, placement);
+  const afterTarget = locateReceiptCompatTarget(modifiedText, provider, modelId, placement);
+  if (targetExistedBefore && !beforeTarget?.targetExists) return undefined;
+  if (!targetExistedBefore && beforeTarget?.targetExists) return undefined;
+  if (!afterTarget?.targetExists) return undefined;
+  if (targetExistedBefore && readReceiptPromptCacheState(originalText, beforeTarget) !== undefined) return undefined;
+  if (!samePromptCacheLifetimes(readReceiptPromptCacheState(modifiedText, afterTarget), promptCache)) return undefined;
+  return parseModelsJsonFixReceipt({
+    version: 2,
+    kind: "pi-cache-optimizer-fix-receipt",
+    transactionId: randomUUID(),
+    provider,
+    modelId,
+    placement,
+    targetExistedBefore,
+    changedKeys: {},
+    promptCacheAdded: promptCache,
+    beforeHash: hashText(originalText),
+    afterHash: hashText(modifiedText),
+    backupFile,
+    createdAt: now,
+    appliedAt: now,
+  });
+}
+
+export type BaseUrlFixPlacement = "provider" | "model";
+
+/**
+ * Locate the object that holds a direct `baseUrl`: the provider object, or
+ * the single custom `models[]` entry with this id. Duplicate provider keys or
+ * duplicate model ids are refused.
+ */
+export function locateBaseUrlTarget(
+  text: string,
+  provider: string,
+  modelId: string,
+  placement: BaseUrlFixPlacement,
+): { objectBrace: number; objectEnd: number } | undefined {
+  if (placement === "provider") {
+    const location = locateProviderCompatInJsonc(text, provider);
+    return location ? { objectBrace: location.providerObjectBrace, objectEnd: location.providerObjectEnd } : undefined;
+  }
+  const location = locateModelInJsonc(text, provider, modelId);
+  if (!location || location.providerKeyCount !== 1 || location.modelObjectBrace < 0) return undefined;
+  if (location.allModelIds.filter((id) => id === modelId).length !== 1) return undefined;
+  return { objectBrace: location.modelObjectBrace, objectEnd: location.modelObjectEnd };
+}
+
+/**
+ * Read the direct `baseUrl` of a target: its string value, `undefined` when
+ * absent, or "invalid" when duplicated, not a string, or unreadable.
+ */
+export function readBaseUrlState(
+  text: string,
+  target: { objectBrace: number; objectEnd: number } | undefined,
+): string | undefined | "invalid" {
+  if (!target) return "invalid";
+  const clean = stripJsoncComments(text);
+  const property = findJsonObjectKey(clean, target.objectBrace, "baseUrl");
+  if (!property || property.keyStart >= target.objectEnd) return undefined;
+  if (property.count !== 1) return "invalid";
+  const valueStart = skipJsonWhitespace(clean, property.valueStart);
+  if (clean[valueStart] !== "\"") return "invalid";
+  const literal = readJsonStringLiteral(clean, valueStart);
+  if (!literal || literal.end > target.objectEnd) return "invalid";
+  return literal.value;
+}
+
+/** Replace the direct `baseUrl` string of a target, or explain why it cannot. */
+export function replaceBaseUrlValue(
+  text: string,
+  target: { objectBrace: number; objectEnd: number },
+  value: string,
+): string | undefined {
+  const property = locateJsonPropertyValueSpan(text, target.objectBrace, target.objectEnd, "baseUrl");
+  if (!property) return undefined;
+  const clean = stripJsoncComments(text);
+  if (clean[property.valueStart] !== "\"") return undefined;
+  return text.slice(0, property.valueStart) + JSON.stringify(value) + text.slice(property.valueEnd);
+}
+
+/**
+ * Receipt for `/cache-optimizer fix kimi-base-url`: a version 3 receipt with
+ * no compat changes and the single baseUrl string the fix rewrote.
+ */
+export function createBaseUrlFixReceipt(
+  originalText: string,
+  modifiedText: string,
+  provider: string,
+  modelId: string,
+  placement: BaseUrlFixPlacement,
+  before: string,
+  after: string,
+  backupPath: string,
+  now: number = Date.now(),
+): ModelsJsonFixReceiptV1 | undefined {
+  const backupFile = basename(backupPath);
+  if (!/^models\.json\.backup-cache-optimizer-/.test(backupFile)) return undefined;
+  if (!isKimiCodeV1BaseUrlChange(before, after)) return undefined;
+  if (readBaseUrlState(originalText, locateBaseUrlTarget(originalText, provider, modelId, placement)) !== before) return undefined;
+  if (readBaseUrlState(modifiedText, locateBaseUrlTarget(modifiedText, provider, modelId, placement)) !== after) return undefined;
+  return parseModelsJsonFixReceipt({
+    version: 3,
+    kind: "pi-cache-optimizer-fix-receipt",
+    transactionId: randomUUID(),
+    provider,
+    modelId,
+    placement,
+    targetExistedBefore: true,
+    changedKeys: {},
+    baseUrlChange: { before, after },
+    beforeHash: hashText(originalText),
+    afterHash: hashText(modifiedText),
+    backupFile,
+    createdAt: now,
+    appliedAt: now,
+  });
 }
 
 export function createModelsJsonFixReceipt(
@@ -1826,15 +2018,39 @@ export function composeModelsJsonReceiptRollback(
     return { error: "the fix created a new target entry and the file changed; refusing to remove user changes automatically" };
   }
 
+  if (receipt.baseUrlChange) {
+    if (receipt.placement === "modelOverride") return { error: "the receipt's baseUrl target is not supported" };
+    const baseUrlTarget = locateBaseUrlTarget(currentText, receipt.provider, receipt.modelId, receipt.placement);
+    const current = readBaseUrlState(currentText, baseUrlTarget);
+    if (current === "invalid" || !baseUrlTarget) return { error: "receipt-owned baseUrl is no longer safely locatable" };
+    if (current !== receipt.baseUrlChange.after) {
+      return { error: "receipt-owned baseUrl was changed after the fix; refusing to overwrite it" };
+    }
+    const modifiedText = replaceBaseUrlValue(currentText, baseUrlTarget, receipt.baseUrlChange.before);
+    if (modifiedText === undefined) return { error: "receipt-owned baseUrl is no longer safely locatable" };
+    return { modifiedText, changed: modifiedText !== currentText };
+  }
+
   const target = locateReceiptCompatTarget(currentText, receipt.provider, receipt.modelId, receipt.placement);
   if (!target?.targetExists) {
     return { error: "the original target entry is missing or no longer safely locatable" };
   }
-  if (target.compatBrace < 0 || target.compatEnd <= target.compatBrace) {
+  const hasCompatChanges = Object.keys(receipt.changedKeys).length > 0;
+  if (hasCompatChanges && (target.compatBrace < 0 || target.compatEnd <= target.compatBrace)) {
     return { error: "the target compat object is missing or no longer safely locatable" };
   }
 
   const edits: JsonPropertyEdit[] = [];
+  if (receipt.promptCacheAdded) {
+    const current = readReceiptPromptCacheState(currentText, target);
+    if (current === "invalid") return { error: "receipt-owned promptCache is no longer safely locatable" };
+    if (current === undefined || !samePromptCacheLifetimes(current, receipt.promptCacheAdded)) {
+      return { error: "receipt-owned promptCache was changed after the fix; refusing to overwrite it" };
+    }
+    const property = locateJsonPropertyValueSpan(currentText, target.objectBrace, target.objectEnd, "promptCache");
+    if (!property) return { error: "receipt-owned promptCache is no longer safely locatable" };
+    edits.push(property.removal);
+  }
   for (const [key, change] of Object.entries(receipt.changedKeys)) {
     const current = readReceiptCompatScalarState(currentText, target, key);
     if (!current || !sameReceiptScalarState(current, change.after)) {
@@ -1876,11 +2092,20 @@ export function validateModelsJsonRollback(
   // newly created target entry (which intentionally did not exist before).
   if (expectedHash !== undefined) return null;
 
+  if (receipt.baseUrlChange) {
+    if (receipt.placement === "modelOverride") return "rollback result has an unsupported baseUrl target";
+    const state = readBaseUrlState(writtenText, locateBaseUrlTarget(writtenText, receipt.provider, receipt.modelId, receipt.placement));
+    return state === receipt.baseUrlChange.before ? null : "rollback result did not restore baseUrl";
+  }
+
   const target = locateReceiptCompatTarget(writtenText, receipt.provider, receipt.modelId, receipt.placement);
   if (!target?.targetExists) return "rollback result lost the original target entry";
   for (const [key, change] of Object.entries(receipt.changedKeys)) {
     const state = readReceiptCompatScalarState(writtenText, target, key);
     if (!state || !sameReceiptScalarState(state, change.before)) return `rollback result did not restore compat.${key}`;
+  }
+  if (receipt.promptCacheAdded && readReceiptPromptCacheState(writtenText, target) !== undefined) {
+    return "rollback result did not remove promptCache";
   }
   return null;
 }

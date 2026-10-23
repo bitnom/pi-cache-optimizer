@@ -70,7 +70,13 @@ async function loadHarness(dir: string, sessionId = "fixture-review-session") {
   const hook = async (name: string, event: unknown = {}) => {
     const handler = hooks.get(name);
     assert.ok(handler, `Missing hook ${name}`);
-    return handler(event, ctx as unknown as ExtensionContext);
+    const result = await handler(event, ctx as unknown as ExtensionContext);
+    // 2.10: these hooks refresh the footer in the background; the
+    // assertions below are about what that refresh publishes.
+    if (name === "message_end" || name === "tool_execution_end" || name === "agent_settled") {
+      await loaded.__internals_for_tests.statsRefreshSettled();
+    }
+    return result;
   };
   const command = async (args: string) => {
     const registered = commands.get("cache-optimizer");
@@ -80,6 +86,7 @@ async function loadHarness(dir: string, sessionId = "fixture-review-session") {
   let closed = false;
   const close = async () => { if (!closed) { closed = true; await hook("session_shutdown"); } };
   await hook("session_start", { reason: "startup" });
+  await loaded.__internals_for_tests.waitForStatsRestore();
   const persistedModels = async () => {
     await close();
     const shards = await loaded.__internals_for_tests.readValidStatsShardsV7();

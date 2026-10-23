@@ -13,8 +13,34 @@ export type FixReceiptCompatChange = {
   after: ReceiptScalarState;
 };
 
+/** Pi model-level prompt-cache lifetimes in seconds (`promptCache`). */
+export type PromptCacheLifetimes = { short?: number; long?: number };
+
+export function isValidPromptCacheLifetimes(value: unknown): value is PromptCacheLifetimes {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+  const record = value as Record<string, unknown>;
+  const keys = Object.keys(record);
+  if (keys.length === 0 || keys.some((key) => key !== "short" && key !== "long")) return false;
+  return keys.every((key) => {
+    const seconds = record[key];
+    return typeof seconds === "number" && Number.isSafeInteger(seconds) && seconds > 0;
+  });
+}
+
+export function samePromptCacheLifetimes(left: unknown, right: unknown): boolean {
+  if (!isValidPromptCacheLifetimes(left) || !isValidPromptCacheLifetimes(right)) return false;
+  return left.short === right.short && left.long === right.long;
+}
+
+/**
+ * Version 1 receipts record scalar compat changes only. Version 2 receipts
+ * also record a `promptCache` object the fix added (it never overwrites one),
+ * so rollback can remove exactly that property. Version 3 receipts record a
+ * single `baseUrl` string rewrite (`/cache-optimizer fix kimi-base-url`).
+ * Older extension versions reject newer receipts instead of misreading them.
+ */
 export type ModelsJsonFixReceiptV1 = {
-  version: 1;
+  version: 1 | 2 | 3;
   kind: "pi-cache-optimizer-fix-receipt";
   transactionId: string;
   provider: string;
@@ -22,6 +48,13 @@ export type ModelsJsonFixReceiptV1 = {
   placement: FixReceiptPlacement;
   targetExistedBefore: boolean;
   changedKeys: Record<string, FixReceiptCompatChange>;
+  /** Version 2 only: the promptCache object added at the target (absent before). */
+  promptCacheAdded?: PromptCacheLifetimes;
+  /**
+   * Version 3 only: the `baseUrl` string the fix rewrote at the provider or
+   * custom model target (official Kimi Code `/coding` → `/coding/v1`).
+   */
+  baseUrlChange?: { before: string; after: string };
   beforeHash: string;
   afterHash: string;
   backupFile: string;

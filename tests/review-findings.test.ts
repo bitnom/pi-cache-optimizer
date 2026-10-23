@@ -90,6 +90,7 @@ describe("footer status separation and command completion", () => {
       const sessionStart = handlers.get("session_start");
       assert.ok(sessionStart);
       await sessionStart({ reason: "startup" }, context);
+      await freshModule.__internals_for_tests.waitForStatsRestore();
 
       assert.equal(statuses.at(-1)?.key, "pi-cache-stats");
       assert.match(statuses.at(-1)?.value ?? "", /^· OpenAI cache /);
@@ -113,7 +114,7 @@ describe("footer status separation and command completion", () => {
     );
     assert.deepEqual(
       internals.getCacheOptimizerArgumentCompletions("config "),
-      ["footer-mode", "prompt-rewrite", "virtual-rewrite", "skill-compression", "openai-cache-key", "tool-order", "reset"].map((value) => ({ value: `config ${value}`, label: value })),
+      ["footer-mode", "prompt-rewrite", "virtual-rewrite", "skill-compression", "openai-cache-key", "tool-order", "zero-price-warming", "stats-incremental", "reset"].map((value) => ({ value: `config ${value}`, label: value })),
     );
     assert.deepEqual(
       internals.getCacheOptimizerArgumentCompletions("stats "),
@@ -133,7 +134,7 @@ describe("footer status separation and command completion", () => {
     );
     assert.deepEqual(
       internals.getCacheOptimizerArgumentCompletions("fix p"),
-      [{ value: "fix prompt-cache-key", label: "prompt-cache-key" }],
+      [{ value: "fix prompt-cache", label: "prompt-cache" }, { value: "fix prompt-cache-key", label: "prompt-cache-key" }],
     );
     assert.equal(internals.getCacheOptimizerArgumentCompletions("unknown "), null);
     assert.equal(internals.getCacheOptimizerArgumentCompletions("config unknown "), null);

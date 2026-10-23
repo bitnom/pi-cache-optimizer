@@ -19,15 +19,21 @@ export function escapeXml(value: string): string {
     .replace(/'/g, "&apos;");
 }
 
-/** The tool Pi tells the model to load skill files with: `read` when selected, otherwise `bash`; undefined when neither. */
-export type SkillFileReadTool = "read" | "bash";
+/**
+ * The tool Pi tells the model to load skill files with: the first declared of `read`/`bash`;
+ * `indirect` when they are selected but hidden (reachable only through another tool); undefined when neither.
+ */
+export type SkillFileReadTool = "read" | "bash" | "indirect";
 
-export function skillFileReadTool(opts: Pick<BuildSystemPromptOptions, "selectedTools">): SkillFileReadTool | undefined {
-  const tools = opts.selectedTools ?? ["read", "bash", "edit", "write"];
-  return (["read", "bash"] as const).find((tool) => tools.includes(tool));
+export function skillFileReadTool(opts: Pick<BuildSystemPromptOptions, "selectedTools" | "hiddenTools">): SkillFileReadTool | undefined {
+  const selected = opts.selectedTools ?? ["read", "bash", "edit", "write"];
+  const hidden = opts.hiddenTools ?? [];
+  const readers = ["read", "bash"] as const;
+  return readers.find((tool) => selected.includes(tool) && !hidden.includes(tool)) ??
+    (readers.some((tool) => selected.includes(tool)) ? "indirect" : undefined);
 }
 
-/** Byte-for-byte copy of Pi's formatter (contract-tested against the installed Pi for both tool wordings). */
+/** Byte-for-byte copy of Pi's formatter (contract-tested against the installed Pi for every tool wording). */
 export function formatSkillsForPrompt(skills: NonNullable<BuildSystemPromptOptions["skills"]>, fileReadTool: SkillFileReadTool = "read"): string {
   const visibleSkills = skills.filter((skill) => !skill.disableModelInvocation);
   if (visibleSkills.length === 0) return "";
@@ -36,7 +42,9 @@ export function formatSkillsForPrompt(skills: NonNullable<BuildSystemPromptOptio
     "\n\nThe following skills provide specialized instructions for specific tasks.",
     fileReadTool === "read"
       ? "Use the read tool to load a skill's file when the task matches its description."
-      : "Use bash to load a skill's file when the task matches its description.",
+      : fileReadTool === "bash"
+        ? "Use bash to load a skill's file when the task matches its description."
+        : "Load a skill's file when the task matches its description.",
     "When a skill file references a relative path, resolve it against the skill directory (parent of SKILL.md / dirname of the path) and use that absolute path in tool commands.",
     "",
     "<available_skills>",
@@ -174,6 +182,12 @@ export function compressSkillsInSystemPrompt(
  * position and `<skills>` wrapper. Returns true only when Pi's re-rendered prompt
  * really contains the compressed list; otherwise the section is restored and the
  * caller falls back to the string substitution.
+ *
+ * A custom base prompt (`customPrompt`) can hold its own copy of the verbose
+ * list: pi-subagents passes the parent's rendered prompt there, and an idle
+ * parent renders its unedited base options. That copy is compressed in place
+ * too; otherwise the re-render still contains the verbose list, the section edit
+ * is rolled back, and the string fallback forces the prompt.
  */
 export function compressSkillsViaSection(event: {
   readonly systemPrompt: string;
@@ -191,11 +205,23 @@ export function compressSkillsViaSection(event: {
   const compressed = formatSkillsForPromptCompressed(options.skills, skillFileReadTool(options) ?? "read").trim();
   if (!compressed || compressed.length >= verbose.length) return false;
 
+  const previousCustom = options.customPrompt;
+  const customHasVerbose = typeof previousCustom === "string" && previousCustom.includes(verbose);
+  if (customHasVerbose) options.customPrompt = previousCustom.split(verbose).join(compressed);
+  // Only the custom prompt held the list (Pi renders no skills section of its own, e.g. no
+  // read/bash tool): done, and no `<skills>` section is added where Pi renders none.
+  if (customHasVerbose && !event.systemPrompt.includes(verbose)) {
+    if (event.systemPrompt.includes(compressed)) return true;
+    options.customPrompt = previousCustom;
+    return false;
+  }
+
   const previous = sections.skills;
   sections.skills = compressed;
   if (event.systemPrompt.includes(compressed) && !event.systemPrompt.includes(verbose)) return true;
   if (previous === undefined) delete sections.skills;
   else sections.skills = previous;
+  options.customPrompt = previousCustom;
   return false;
 }
 

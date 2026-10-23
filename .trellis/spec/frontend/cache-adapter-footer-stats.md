@@ -56,6 +56,7 @@ message-local physical `responseModel`; native routing uses its catalog dispatch
 |---|---|---|
 | DeepSeek | `deepseek` | `DS cache` |
 | OpenAI-family (GPT) | `gpt-`, `chatgpt`, or pattern `o[1345]` with safe boundaries | `OpenAI cache` |
+| OpenCode Zen Space Bunny | `space-bunny` | `Space Bunny cache` |
 | Kimi / Moonshot | `kimi` | `Kimi cache` |
 | Qwen / Alibaba | `qwen` | `Qwen cache` |
 | GLM / Zhipu | `glm` | `GLM cache` |

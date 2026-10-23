@@ -73,6 +73,7 @@ export function modelFromAssistantMessage(message: unknown, fallback: PiModel | 
 export type OpenAIShapedFamily = { label: string; needles: string[]; pattern?: RegExp };
 
 export const OPENAI_SHAPED_FAMILIES: OpenAIShapedFamily[] = [
+  { label: "Space Bunny cache", needles: ["space-bunny"] },
   { label: "Kimi cache", needles: ["kimi"] },
   { label: "Qwen cache", needles: ["qwen"] },
   { label: "GLM cache", needles: ["glm"] },

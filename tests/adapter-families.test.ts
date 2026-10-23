@@ -95,6 +95,32 @@ const model = (id: string, api = "openai-completions") => ({
 }) as any;
 
 describe("model family adapter selection", () => {
+  test("Space Bunny selects by active id or name, independent of transport metadata", () => {
+    const active = { ...model("space-bunny-free"), provider: "other", api: "custom-api", baseUrl: "https://other.example/v1" };
+    assert.equal(internals.selectAdapterForModel(active)?.label, "Space Bunny cache");
+    assert.equal(internals.selectAdapterForModel({ ...model("unrelated-model"), name: "Space-Bunny Free" })?.label, "Space Bunny cache");
+
+    const unrelated = { ...model("unrelated-model"), provider: "opencode", api: "openai-completions", baseUrl: "https://opencode.ai/zen/v1" };
+    assert.equal(internals.selectAdapterForModel(unrelated), undefined);
+    assert.equal(internals.selectAdapterForAssistantMessage({ role: "assistant", model: "unrelated-model", provider: "opencode", api: "openai-completions" }, unrelated), undefined);
+  });
+
+  test("Space Bunny selects from assistant message model or name", () => {
+    const unrelated = model("unrelated-model");
+    assert.equal(internals.selectAdapterForAssistantMessage({ role: "assistant", model: "space-bunny-free" }, unrelated)?.label, "Space Bunny cache");
+    assert.equal(internals.selectAdapterForAssistantMessage({ role: "assistant", model: "unrelated-model", name: "Space-Bunny Free" }, unrelated)?.label, "Space Bunny cache");
+  });
+
+  test("Space Bunny normalizes Pi and raw OpenAI-shaped cache usage without inventing hits", () => {
+    const adapter = internals.selectAdapterForModel(model("space-bunny-free"))!;
+    assert.equal(adapter.id, "openai");
+    assert.deepEqual(adapter.normalizeUsage({ role: "assistant", usage: { input: 100, cacheRead: 40, cacheWrite: 10 } }),
+      { cacheRead: 40, cacheWrite: 10, totalInput: 150 });
+    assert.deepEqual(adapter.normalizeUsage({ role: "assistant", usage: { prompt_tokens: 150, prompt_tokens_details: { cached_tokens: 40 } } }),
+      { cacheRead: 40, cacheWrite: 0, totalInput: 150 });
+    assert.equal(adapter.normalizeUsage({ role: "assistant", usage: { prompt_tokens: 150 } }), undefined);
+  });
+
   test("resolves each model name to the same footer adapter as before the table refactor", () => {
     for (const [name, label] of EXPECTED_LABELS) {
       assert.equal(internals.selectAdapterForModel(model(name))?.label ?? null, label, `model ${JSON.stringify(name)}`);

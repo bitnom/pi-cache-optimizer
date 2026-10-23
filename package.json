@@ -29,7 +29,7 @@
     "#extension": "./index.ts"
   },
   "scripts": {
-    "test": "node --import jiti/register --test tests/*.test.ts",
+    "test": "node --import ./tests/scrub-retention-env.mjs --import jiti/register --test tests/*.test.ts",
     "typecheck": "tsc --noEmit --pretty false",
     "check:diff": "git diff --check",
     "check:pack": "node scripts/check-pack.mjs",
@@ -37,8 +37,7 @@
     "check:modules": "node scripts/check-module-graph.mjs"
   },
   "devDependencies": {
-    "@earendil-works/pi-coding-agent": "^1.3.0",
-    "@earendil-works/pi-server": "^1.1.0",
+    "@earendil-works/pi-coding-agent": "^1.4.0",
     "@types/node": "^22.0.0",
     "jiti": "^2.7.0",
     "typescript": "^5.8.3"
